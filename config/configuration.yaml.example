@@ -1,0 +1,8 @@
+# Example Home Assistant configuration for Whisker Ting
+# The integration is configured through the UI, not YAML
+
+# Enable debug logging (optional)
+logger:
+  default: info
+  logs:
+    custom_components.whisker_ting: debug

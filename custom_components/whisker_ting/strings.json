@@ -1,0 +1,116 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Whisker Ting",
+        "description": "Enter your Whisker Ting account credentials. These are the same credentials you use in the Ting app.",
+        "data": {
+          "username": "Email",
+          "password": "Password"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate with Whisker Ting",
+        "description": "Your authentication has expired. Please enter your credentials to restore the connection.",
+        "data": {
+          "username": "Email",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid email or password",
+      "cannot_connect": "Unable to connect to Whisker Ting API",
+      "unknown": "An unknown error occurred"
+    },
+    "abort": {
+      "already_configured": "This account is already configured",
+      "reauth_successful": "Reauthentication successful"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Configure Whisker Ting",
+        "data": {
+          "scan_interval": "Update interval (seconds)"
+        },
+        "data_description": {
+          "scan_interval": "How often to poll the Whisker Ting API for updates (30-3600 seconds)"
+        }
+      }
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "fire_hazard": {
+        "name": "Fire Hazard"
+      },
+      "electrical_fire_hazard": {
+        "name": "Electrical Fire Hazard"
+      },
+      "unverified_fire_hazard": {
+        "name": "Unverified Fire Hazard"
+      },
+      "frozen_pipe": {
+        "name": "Frozen Pipe Risk"
+      },
+      "learning_mode": {
+        "name": "Learning Mode"
+      },
+      "hvac_verified": {
+        "name": "HVAC Verified"
+      },
+      "is_owner": {
+        "name": "Is Owner"
+      }
+    },
+    "sensor": {
+      "hazard_status": {
+        "name": "Hazard Status",
+        "state": {
+          "no_hazards": "No Hazards",
+          "hazard_detected": "Hazard Detected",
+          "reviewed_not_fire": "Reviewed - Not Fire",
+          "learning": "Learning"
+        }
+      },
+      "hazard_message": {
+        "name": "Hazard Message"
+      },
+      "efh_status": {
+        "name": "Electrical Fire Hazard Status"
+      },
+      "efh_message": {
+        "name": "Electrical Fire Hazard Message"
+      },
+      "efh_level": {
+        "name": "Electrical Fire Hazard Level"
+      },
+      "ufh_status": {
+        "name": "Unverified Fire Hazard Status"
+      },
+      "ufh_message": {
+        "name": "Unverified Fire Hazard Message"
+      },
+      "device_type": {
+        "name": "Device Type"
+      },
+      "firmware_version": {
+        "name": "Firmware Version"
+      },
+      "wifi_mac": {
+        "name": "WiFi MAC Address"
+      },
+      "bluetooth_mac": {
+        "name": "Bluetooth MAC Address"
+      },
+      "serial_number": {
+        "name": "Serial Number"
+      },
+      "group_name": {
+        "name": "Group"
+      }
+    }
+  }
+}

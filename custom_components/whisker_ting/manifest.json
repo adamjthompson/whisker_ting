@@ -1,0 +1,13 @@
+{
+  "domain": "whisker_ting",
+  "name": "Whisker Ting",
+  "codeowners": ["@aidenmitchell"],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/aidenmitchell/ha-whisker-ting",
+  "integration_type": "service",
+  "iot_class": "cloud_push",
+  "issue_tracker": "https://github.com/aidenmitchell/ha-whisker-ting/issues",
+  "requirements": ["aiohttp>=3.8.0", "msgpack>=1.0.0"],
+  "version": "1.0.0"
+}
