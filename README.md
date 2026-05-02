@@ -1,7 +1,4 @@
-# Whisker Ting Integration for Home Assistant
-
-[![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://github.com/hacs/integration)
-[![GitHub Release](https://img.shields.io/github/release/aidenmitchell/ha-whisker-ting.svg)](https://github.com/aidenmitchell/ha-whisker-ting/releases)
+# Ting Integration for Home Assistant
 
 Home Assistant integration for [Whisker Labs Ting](https://www.tingfire.com/) electrical fire safety sensors.
 
