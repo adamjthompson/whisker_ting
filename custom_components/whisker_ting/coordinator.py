@@ -8,15 +8,29 @@ from datetime import timedelta
 
 import aiohttp
 
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import DeviceState, VoltageReading, WhiskerApiClient, WhiskerApiError, WhiskerAuthError
-from .const import DEFAULT_SCAN_INTERVAL, DOMAIN
+from .const import CONF_STATION_IDS, DEFAULT_SCAN_INTERVAL, DOMAIN
 from .websocket import VoltageData, WhiskerWebSocketManager
 
 _LOGGER = logging.getLogger(__name__)
+
+# Station ID candidates to probe, in order of likelihood.
+# The first one that results in voltage data being received is persisted.
+_STATION_ID_CANDIDATES = [
+    lambda d: d.serial_number,
+    lambda d: str(d.site_id) if d.site_id else None,
+    lambda d: d.soc_serial_number,
+    lambda d: str(d.group_id) if d.group_id else None,
+]
+
+# How long to wait for voltage data after sending InitializeStreaming
+# before giving up and trying the next candidate
+_PROBE_TIMEOUT = 10.0  # seconds
 
 
 class WhiskerDataUpdateCoordinator(DataUpdateCoordinator[dict[str, DeviceState]]):
@@ -27,6 +41,7 @@ class WhiskerDataUpdateCoordinator(DataUpdateCoordinator[dict[str, DeviceState]]
         hass: HomeAssistant,
         client: WhiskerApiClient,
         session: aiohttp.ClientSession,
+        entry: ConfigEntry,
         update_interval_seconds: int = DEFAULT_SCAN_INTERVAL,
     ) -> None:
         """Initialize the coordinator."""
@@ -38,9 +53,15 @@ class WhiskerDataUpdateCoordinator(DataUpdateCoordinator[dict[str, DeviceState]]
         )
         self.client = client
         self._session = session
+        self._entry = entry
         self._last_update_success: bool | None = None
         self._ws_manager: WhiskerWebSocketManager | None = None
         self._ws_connected = False
+        # Discovered station_ids keyed by device serial number, loaded from
+        # config entry options so successful probes persist across restarts
+        self._discovered_station_ids: dict[str, str] = dict(
+            entry.options.get(CONF_STATION_IDS, {})
+        )
 
     @callback
     def _handle_voltage_update(self, station_id: str, voltage_data: VoltageData) -> None:
@@ -53,7 +74,7 @@ class WhiskerDataUpdateCoordinator(DataUpdateCoordinator[dict[str, DeviceState]]
         if self.data is None:
             return
 
-        VOLTAGE_CHANGE_THRESHOLD = 0.1  # Volts
+        VOLTAGE_CHANGE_THRESHOLD = 0.01  # Volts
 
         def _changed(new: float, old: float) -> bool:
             """Return True if the value changed beyond the threshold."""
@@ -83,8 +104,79 @@ class WhiskerDataUpdateCoordinator(DataUpdateCoordinator[dict[str, DeviceState]]
                 self.async_set_updated_data(self.data)
                 break
 
+    async def _probe_station_id(
+        self,
+        device_state: DeviceState,
+        get_stream_token,
+    ) -> str | None:
+        """Try each candidate station_id until one produces voltage data.
+
+        Returns the working station_id, or None if none of the candidates work.
+        The result is persisted to config entry options so future restarts skip
+        the probe and connect directly with the known-good value.
+        """
+        for candidate_fn in _STATION_ID_CANDIDATES:
+            candidate = candidate_fn(device_state)
+            if not candidate:
+                continue
+
+            _LOGGER.debug(
+                "Probing station_id candidate '%s' for device %s",
+                candidate,
+                device_state.serial_number,
+            )
+
+            connected = await self._ws_manager.connect_device(
+                get_stream_token=get_stream_token,
+                user_id=self.client.user_id,
+                station_id=candidate,
+            )
+
+            if not connected:
+                _LOGGER.debug("Could not connect with station_id '%s', trying next", candidate)
+                continue
+
+            # Wait up to _PROBE_TIMEOUT seconds for voltage data to arrive
+            received = await self._ws_manager.wait_for_data(candidate, timeout=_PROBE_TIMEOUT)
+
+            if received:
+                _LOGGER.info(
+                    "Discovered working station_id '%s' for device %s",
+                    candidate,
+                    device_state.serial_number,
+                )
+                # Persist so future restarts skip probing
+                self._discovered_station_ids[device_state.serial_number] = candidate
+                new_options = {
+                    **self._entry.options,
+                    CONF_STATION_IDS: self._discovered_station_ids,
+                }
+                self.hass.config_entries.async_update_entry(
+                    self._entry, options=new_options
+                )
+                return candidate
+
+            # No data — disconnect and try next candidate
+            _LOGGER.debug(
+                "No data received for station_id '%s' within %.0fs, trying next",
+                candidate,
+                _PROBE_TIMEOUT,
+            )
+            await self._ws_manager.disconnect_device(candidate)
+
+        _LOGGER.warning(
+            "Could not find a working station_id for device %s — "
+            "voltage sensors will be unavailable",
+            device_state.serial_number,
+        )
+        return None
+
     async def _connect_websocket(self, data: dict[str, DeviceState]) -> None:
-        """Connect to WebSocket for real-time updates."""
+        """Connect to WebSocket for real-time updates.
+
+        Uses a previously discovered station_id if available, otherwise probes
+        each candidate in order until one produces voltage data.
+        """
         if self._ws_manager is None:
             self._ws_manager = WhiskerWebSocketManager(
                 session=self._session,
@@ -100,11 +192,6 @@ class WhiskerDataUpdateCoordinator(DataUpdateCoordinator[dict[str, DeviceState]]
             _LOGGER.debug("No user_id available, skipping WebSocket connection")
             return
 
-        # Provide a callback that returns the api_key for WebSocket stream auth.
-        # The api_key (from Cognito user attributes) is the credential the
-        # SignalR server expects for InitializeStreaming — not the access token.
-        # We still call _ensure_token() first to guarantee the client is
-        # authenticated and api_key has been populated.
         async def get_stream_token() -> str:
             await self.client._ensure_token()
             api_key = self.client.api_key
@@ -113,28 +200,44 @@ class WhiskerDataUpdateCoordinator(DataUpdateCoordinator[dict[str, DeviceState]]
             _LOGGER.debug("Using api_key for WebSocket stream auth (length=%d)", len(api_key))
             return api_key
 
-        # Connect to each device's WebSocket stream
         for device_id, device_state in data.items():
-            if device_state.station_id:
+            # Use previously discovered station_id if we have one
+            known_station_id = self._discovered_station_ids.get(device_state.serial_number)
+
+            if known_station_id:
+                _LOGGER.debug(
+                    "Using known station_id '%s' for device %s",
+                    known_station_id,
+                    device_state.serial_number,
+                )
                 try:
                     connected = await self._ws_manager.connect_device(
                         get_stream_token=get_stream_token,
                         user_id=user_id,
-                        station_id=device_state.station_id,
+                        station_id=known_station_id,
                     )
                     if connected:
                         _LOGGER.info(
                             "Connected to WebSocket for device %s (station %s)",
                             device_id,
-                            device_state.station_id,
+                            known_station_id,
                         )
                         self._ws_connected = True
+                        device_state.station_id = known_station_id
                 except Exception as err:
                     _LOGGER.warning(
-                        "Failed to connect WebSocket for device %s: %s",
-                        device_id,
-                        err,
+                        "Failed to connect WebSocket for device %s: %s", device_id, err
                     )
+            else:
+                # No known station_id — probe candidates to find one that works
+                _LOGGER.info(
+                    "No known station_id for device %s, probing candidates",
+                    device_state.serial_number,
+                )
+                station_id = await self._probe_station_id(device_state, get_stream_token)
+                if station_id:
+                    self._ws_connected = True
+                    device_state.station_id = station_id
 
     async def async_shutdown(self) -> None:
         """Shutdown the coordinator."""
@@ -159,23 +262,16 @@ class WhiskerDataUpdateCoordinator(DataUpdateCoordinator[dict[str, DeviceState]]
                 _LOGGER.info("Connection to Whisker Ting API restored")
             self._last_update_success = True
 
-            # Connect WebSocket on first fetch and wait for data
+            # Connect WebSocket on first fetch
             if not self._ws_connected:
                 await self._connect_websocket(data)
-                # Wait for actual voltage data to arrive (not arbitrary sleep)
+                # Preserve any voltage data received during probing
                 if self._ws_connected and self._ws_manager:
-                    # Wait for data from all devices in parallel
-                    wait_tasks = [
-                        self._ws_manager.wait_for_data(device_state.station_id, timeout=5.0)
-                        for device_state in data.values()
-                        if device_state.station_id
-                    ]
-                    if wait_tasks:
-                        await asyncio.gather(*wait_tasks)
-                    # Update data with voltage readings received
                     for device_id, device_state in data.items():
                         if device_state.station_id:
-                            voltage_data = self._ws_manager.get_voltage_data(device_state.station_id)
+                            voltage_data = self._ws_manager.get_voltage_data(
+                                device_state.station_id
+                            )
                             if voltage_data:
                                 device_state.voltage = VoltageReading(
                                     voltage=voltage_data.voltage,

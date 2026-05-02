@@ -72,7 +72,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.config_entries.async_update_entry(entry, data=new_data)
 
     # Create the coordinator
-    coordinator = WhiskerDataUpdateCoordinator(hass, client, session, scan_interval)
+    coordinator = WhiskerDataUpdateCoordinator(hass, client, session, entry, scan_interval)
 
     # Fetch initial data
     await coordinator.async_config_entry_first_refresh()

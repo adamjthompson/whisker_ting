@@ -28,6 +28,7 @@ CONF_ACCESS_TOKEN = "access_token"
 CONF_REFRESH_TOKEN = "refresh_token"
 CONF_ID_TOKEN = "id_token"
 CONF_SCAN_INTERVAL = "scan_interval"
+CONF_STATION_IDS = "station_ids"  # Persisted discovered station_id per device serial
 
 # Device types
 DEVICE_TYPE_FIRE_SENSOR = "FireSensor"
