@@ -30,6 +30,8 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Add constant for refresh token locally since it's likely missing from const.py
+CONF_REFRESH_TOKEN = "refresh_token"
 
 class WhiskerConfigFlowHandler(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Whisker Ting."""
@@ -69,11 +71,12 @@ class WhiskerConfigFlowHandler(ConfigFlow, domain=DOMAIN):
                 else:
                     title = f"Whisker Ting ({username})"
 
+                # Discard the password and only save the refresh token
                 return self.async_create_entry(
                     title=title,
                     data={
                         CONF_USERNAME: username,
-                        CONF_PASSWORD: password,
+                        CONF_REFRESH_TOKEN: client._refresh_token,
                     },
                 )
 
@@ -120,11 +123,13 @@ class WhiskerConfigFlowHandler(ConfigFlow, domain=DOMAIN):
             try:
                 await client.get_user_data()
 
+                # Update the entry with the new refresh token and explicitly clear any stored password
                 return self.async_update_reload_and_abort(
                     self._get_reauth_entry(),
                     data_updates={
                         CONF_USERNAME: username,
-                        CONF_PASSWORD: password,
+                        CONF_REFRESH_TOKEN: client._refresh_token,
+                        CONF_PASSWORD: "", 
                     },
                 )
 

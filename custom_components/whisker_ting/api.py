@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import aiohttp
@@ -82,9 +82,6 @@ class DeviceState:
     group_name: str | None = None
     group_id: int | None = None
 
-    # Raw data for debugging
-    raw_data: dict[str, Any] = field(default_factory=dict)
-
 
 @dataclass
 class Site:
@@ -134,7 +131,8 @@ class WhiskerApiClient:
         self,
         session: aiohttp.ClientSession,
         username: str,
-        password: str,
+        password: str | None = None,
+        refresh_token: str | None = None,
     ) -> None:
         """Initialize the API client."""
         self._session = session
@@ -144,7 +142,7 @@ class WhiskerApiClient:
 
         # Token storage
         self._access_token: str | None = None
-        self._refresh_token: str | None = None
+        self._refresh_token: str | None = refresh_token
         self._id_token: str | None = None
         self._api_key: str | None = None
         self._user_id: int | None = None
@@ -166,19 +164,28 @@ class WhiskerApiClient:
         async with self._lock:
             if self._access_token and self._token_expiry:
                 # Refresh if token expires in less than 5 minutes
-                if datetime.now() < self._token_expiry - timedelta(minutes=5):
+                if datetime.now(UTC) < self._token_expiry - timedelta(minutes=5):
                     return self._access_token
 
             # Need to authenticate or refresh
             if self._refresh_token:
                 try:
                     await self._refresh_access_token()
+                    # If user_id wasn't populated from a prior full auth,
+                    # fetch user attributes now so the API URL and api_key are correct
+                    if not self._user_id:
+                        await self._fetch_user_attributes()
                     return self._access_token
                 except AuthenticationError:
-                    # Refresh failed, try full auth
+                    # Refresh failed, try full auth if we have a password
+                    if not self._password:
+                         raise WhiskerAuthError("Refresh token expired and no password available")
                     pass
 
             # Full authentication
+            if not self._password:
+                raise WhiskerAuthError("No password available for authentication")
+
             await self._authenticate()
             return self._access_token
 
@@ -192,8 +199,9 @@ class WhiskerApiClient:
             self._refresh_token = result["refresh_token"]
             self._id_token = result["id_token"]
 
-            # Token expires in 1 hour typically
-            self._token_expiry = datetime.now() + timedelta(hours=1)
+            # Use Cognito provided ExpiresIn or default to 1 hour
+            expires_in = result.get("ExpiresIn", 3600)
+            self._token_expiry = datetime.now(UTC) + timedelta(seconds=expires_in)
 
             # Extract user info from attributes
             user_attrs = {
@@ -216,12 +224,39 @@ class WhiskerApiClient:
 
             self._access_token = result["AccessToken"]
             self._id_token = result.get("IdToken", self._id_token)
-            self._token_expiry = datetime.now() + timedelta(hours=1)
+            
+            # Use Cognito provided ExpiresIn or default to 1 hour
+            expires_in = result.get("ExpiresIn", 3600)
+            self._token_expiry = datetime.now(UTC) + timedelta(seconds=expires_in)
 
             _LOGGER.debug("Access token refreshed")
 
         except AuthenticationError as err:
             raise WhiskerAuthError(str(err)) from err
+
+    async def _fetch_user_attributes(self) -> None:
+        """Fetch user attributes from Cognito to populate user_id and api_key.
+
+        Called after a token refresh when user_id and api_key were not populated
+        by a prior full authentication (e.g. on a fresh install with only a
+        refresh token stored).
+        """
+        _LOGGER.debug("Fetching user attributes from Cognito")
+        try:
+            user_info = await self._auth._get_user(self._access_token)
+            user_attrs = {
+                attr["Name"]: attr["Value"]
+                for attr in user_info.get("UserAttributes", [])
+            }
+            self._user_id = int(user_attrs.get("custom:user_id", 0))
+            self._api_key = user_attrs.get("custom:api_key")
+            _LOGGER.debug(
+                "User attributes fetched, user_id=%s, api_key present: %s",
+                self._user_id,
+                bool(self._api_key),
+            )
+        except Exception as err:
+            raise WhiskerAuthError(f"Failed to fetch user attributes: {err}") from err
 
     async def _request(
         self,
@@ -240,6 +275,8 @@ class WhiskerApiClient:
 
         url = f"{API_BASE_URL}{endpoint}"
 
+        _LOGGER.debug("Making API request: %s %s (api_key present: %s)", method, url, bool(self._api_key))
+
         try:
             async with self._session.request(
                 method, url, headers=headers, **kwargs
@@ -247,7 +284,13 @@ class WhiskerApiClient:
                 if response.status == 401:
                     # Token might have expired, try refreshing once
                     async with self._lock:
-                        await self._authenticate()
+                        if self._password:
+                            await self._authenticate()
+                        elif self._refresh_token:
+                            await self._refresh_access_token()
+                        else:
+                            raise WhiskerAuthError("Authentication failed: No credentials to retry")
+                    
                     token = self._access_token
                     headers["Authorization"] = f"Bearer {token}"
                     async with self._session.request(
@@ -260,6 +303,10 @@ class WhiskerApiClient:
 
                 if response.status != 200:
                     text = await response.text()
+                    _LOGGER.debug(
+                        "API request failed: method=%s url=%s status=%s body=%s",
+                        method, url, response.status, text
+                    )
                     raise WhiskerApiError(
                         f"API request failed with status {response.status}: {text}"
                     )
@@ -314,6 +361,7 @@ class WhiskerApiClient:
 
     def _parse_device(self, data: dict[str, Any]) -> DeviceState:
         """Parse device state from API response."""
+        _LOGGER.debug("Raw device data from API: %s", data)
         # Parse fire hazard status
         fhs_data = data.get("fireHazardStatus", {})
         efh_data = fhs_data.get("efhStatus", {})
@@ -349,7 +397,7 @@ class WhiskerApiClient:
         # Parse group info
         group_data = data.get("group", {})
 
-        # Get station_id for WebSocket - it's the serial number
+        # Get station_id for WebSocket - the serial number is the correct stream identifier
         station_id = data.get("serialNumber", "")
 
         return DeviceState(
@@ -369,7 +417,6 @@ class WhiskerApiClient:
             fire_hazard_status=fire_hazard_status,
             group_name=group_data.get("name"),
             group_id=group_data.get("id"),
-            raw_data=data,
         )
 
     async def get_all_device_states(self) -> dict[str, DeviceState]:

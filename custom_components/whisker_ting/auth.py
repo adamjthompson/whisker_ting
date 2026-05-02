@@ -279,8 +279,7 @@ class WhiskerAuth:
             COGNITO_IDP_URL, json=payload, headers=headers
         ) as resp:
             if resp.status != 200:
-                text = await resp.text()
-                raise AuthenticationError(f"Token refresh failed: {text}")
+                raise AuthenticationError(f"Token refresh failed (HTTP {resp.status})")
 
             result = await resp.json(content_type=None)
 
@@ -310,7 +309,7 @@ class WhiskerAuth:
                 text = await resp.text()
                 if "UserNotFoundException" in text or "NotAuthorizedException" in text:
                     raise AuthenticationError("Invalid username or password")
-                raise AuthenticationError(f"Auth initiation failed: {text}")
+                raise AuthenticationError(f"Auth initiation failed (HTTP {resp.status})")
 
             return await resp.json(content_type=None)
 
@@ -335,10 +334,10 @@ class WhiskerAuth:
         ) as resp:
             if resp.status != 200:
                 text = await resp.text()
-                _LOGGER.debug("Challenge response failed: %s", text)
+                _LOGGER.debug("Challenge response failed with status: %s", resp.status)
                 if "NotAuthorizedException" in text:
                     raise AuthenticationError("Invalid username or password")
-                raise AuthenticationError(f"Challenge response failed: {text}")
+                raise AuthenticationError(f"Challenge response failed (HTTP {resp.status})")
 
             return await resp.json(content_type=None)
 
@@ -357,7 +356,6 @@ class WhiskerAuth:
             COGNITO_IDP_URL, json=payload, headers=headers
         ) as resp:
             if resp.status != 200:
-                text = await resp.text()
-                raise AuthenticationError(f"Failed to get user info: {text}")
+                raise AuthenticationError(f"Failed to get user info (HTTP {resp.status})")
 
             return await resp.json(content_type=None)

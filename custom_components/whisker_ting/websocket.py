@@ -6,7 +6,7 @@ import asyncio
 import logging
 import struct
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Callable
 
 import aiohttp
@@ -46,7 +46,7 @@ class WhiskerWebSocket:
     def __init__(
         self,
         session: aiohttp.ClientSession,
-        api_key: str,
+        stream_token: str,
         user_id: int,
         station_id: str,
         on_voltage_update: Callable[[str, VoltageData], None] | None = None,
@@ -54,7 +54,7 @@ class WhiskerWebSocket:
     ) -> None:
         """Initialize the WebSocket client."""
         self._session = session
-        self._api_key = api_key  # The api_key is used as the stream token
+        self._stream_token = stream_token  # Short-lived token used for stream auth
         self._user_id = user_id
         self._station_id = station_id
         self._on_voltage_update = on_voltage_update
@@ -126,7 +126,7 @@ class WhiskerWebSocket:
                     return None
 
                 # Find timestamp (uint64 with 0xd7 or 0xcf prefix)
-                timestamp = datetime.now()  # Default to now
+                timestamp = datetime.now(UTC)  # Default to now (timezone-aware)
                 pos = 0
                 while pos < len(data) - 8:
                     if data[pos] == 0xD7:  # ext8 with type -1 (timestamp)
@@ -137,7 +137,9 @@ class WhiskerWebSocket:
                             # SignalR uses .NET ticks (100ns since 1/1/0001)
                             # Convert to Unix timestamp
                             try:
-                                timestamp = datetime.fromtimestamp(ts_val / 10000000 - 62135596800)
+                                timestamp = datetime.fromtimestamp(
+                                    ts_val / 10000000 - 62135596800, tz=UTC
+                                )
                             except (ValueError, OSError):
                                 pass
                             break
@@ -180,17 +182,23 @@ class WhiskerWebSocket:
             elif msg.type == aiohttp.WSMsgType.TEXT:
                 _LOGGER.debug("Received handshake response: %s", msg.data)
 
-            # Subscribe to device stream using api_key as the token
+            # Subscribe to device stream using stream_token
             init_args = [
                 {"StationId": self._station_id, "DataElement": "ComboBinaryData"},
-                self._api_key,  # Use api_key directly as the stream token
+                self._stream_token,  # Use short-lived token instead of api_key
                 str(self._user_id),
             ]
+            _LOGGER.debug(
+                "Sending InitializeStreaming: station_id=%s, user_id=%s, token_length=%d (using api_key)",
+                self._station_id,
+                self._user_id,
+                len(self._stream_token) if self._stream_token else 0,
+            )
             init_msg = self._encode_invocation("InitializeStreaming", init_args)
             await self._ws.send_bytes(init_msg)
 
             self._connected = True
-            self._last_data_time = datetime.now()
+            self._last_data_time = datetime.now(UTC)
 
             # Start background tasks
             self._receive_task = asyncio.create_task(self._receive_loop())
@@ -250,11 +258,16 @@ class WhiskerWebSocket:
                 )
 
                 if msg.type == aiohttp.WSMsgType.BINARY:
+                    _LOGGER.debug(
+                        "Received binary message (%d bytes): %s",
+                        len(msg.data),
+                        msg.data[:200].hex(),
+                    )
                     # Check if it's a voltage update
                     if b"updateComboBinaryData" in msg.data:
                         voltage_data = self._decode_voltage_data(msg.data)
                         if voltage_data and self._on_voltage_update:
-                            self._last_data_time = datetime.now()
+                            self._last_data_time = datetime.now(UTC)
                             self._on_voltage_update(self._station_id, voltage_data)
                             # Signal that we've received data
                             if not self._first_data_received.is_set():
@@ -297,7 +310,7 @@ class WhiskerWebSocket:
                     break
 
                 if self._last_data_time:
-                    time_since_update = (datetime.now() - self._last_data_time).total_seconds()
+                    time_since_update = (datetime.now(UTC) - self._last_data_time).total_seconds()
                     if time_since_update > self.STALE_DATA_THRESHOLD:
                         _LOGGER.error(
                             "WebSocket data stale for station %s (no update in %.0f seconds), reconnecting",
@@ -339,6 +352,7 @@ class WhiskerWebSocketManager:
     RECONNECT_MIN_DELAY = 5
     RECONNECT_MAX_DELAY = 300  # 5 minutes max
     RECONNECT_BACKOFF_FACTOR = 2
+    RECONNECT_MAX_ATTEMPTS = 12  # Cap retry attempts (~1 hour max duration)
 
     def __init__(
         self,
@@ -350,7 +364,8 @@ class WhiskerWebSocketManager:
         self._on_voltage_update = on_voltage_update
         self._connections: dict[str, WhiskerWebSocket] = {}
         self._voltage_data: dict[str, VoltageData] = {}
-        self._credentials: dict[str, dict] = {}  # Store credentials for reconnect
+        # Store get_stream_token callback and user_id per station — never the token itself
+        self._credentials: dict[str, dict] = {}
         self._reconnect_tasks: dict[str, asyncio.Task] = {}
         self._reconnect_attempts: dict[str, int] = {}
         self._shutting_down = False
@@ -398,6 +413,15 @@ class WhiskerWebSocketManager:
         creds = self._credentials[station_id]
         attempts = self._reconnect_attempts.get(station_id, 0)
 
+        # Check max attempts
+        if attempts >= self.RECONNECT_MAX_ATTEMPTS:
+            _LOGGER.error(
+                "Max reconnection attempts (%d) reached for station %s, giving up",
+                self.RECONNECT_MAX_ATTEMPTS,
+                station_id,
+            )
+            return
+
         # Calculate delay with exponential backoff
         delay = min(
             self.RECONNECT_MIN_DELAY * (self.RECONNECT_BACKOFF_FACTOR ** attempts),
@@ -405,10 +429,11 @@ class WhiskerWebSocketManager:
         )
 
         _LOGGER.info(
-            "Reconnecting to station %s in %.0f seconds (attempt %d)",
+            "Reconnecting to station %s in %.0f seconds (attempt %d of %d)",
             station_id,
             delay,
             attempts + 1,
+            self.RECONNECT_MAX_ATTEMPTS,
         )
 
         await asyncio.sleep(delay)
@@ -418,10 +443,21 @@ class WhiskerWebSocketManager:
 
         self._reconnect_attempts[station_id] = attempts + 1
 
-        # Create new connection
+        # Fetch a fresh token via callback — avoids using a potentially expired stored token
+        try:
+            stream_token = await creds["get_stream_token"]()
+        except Exception as err:
+            _LOGGER.error("Failed to obtain fresh stream token for station %s: %s", station_id, err)
+            if not self._shutting_down:
+                self._reconnect_tasks[station_id] = asyncio.create_task(
+                    self._reconnect_with_backoff(station_id)
+                )
+            return
+
+        # Create new connection with fresh token
         ws = WhiskerWebSocket(
             session=self._session,
-            api_key=creds["api_key"],
+            stream_token=stream_token,
             user_id=creds["user_id"],
             station_id=station_id,
             on_voltage_update=self._handle_voltage_update,
@@ -441,7 +477,7 @@ class WhiskerWebSocketManager:
 
     async def connect_device(
         self,
-        api_key: str,
+        get_stream_token: Callable[[], Any],
         user_id: int,
         station_id: str,
     ) -> bool:
@@ -450,16 +486,23 @@ class WhiskerWebSocketManager:
             _LOGGER.debug("Already connected to station %s", station_id)
             return True
 
-        # Store credentials for reconnection
+        # Store the token-fetching callback and user_id — never the token itself
         self._credentials[station_id] = {
-            "api_key": api_key,
+            "get_stream_token": get_stream_token,
             "user_id": user_id,
         }
         self._reconnect_attempts[station_id] = 0
 
+        # Fetch a fresh token for the initial connection
+        try:
+            stream_token = await get_stream_token()
+        except Exception as err:
+            _LOGGER.error("Failed to obtain stream token for station %s: %s", station_id, err)
+            return False
+
         ws = WhiskerWebSocket(
             session=self._session,
-            api_key=api_key,
+            stream_token=stream_token,
             user_id=user_id,
             station_id=station_id,
             on_voltage_update=self._handle_voltage_update,

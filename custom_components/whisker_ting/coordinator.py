@@ -44,14 +44,35 @@ class WhiskerDataUpdateCoordinator(DataUpdateCoordinator[dict[str, DeviceState]]
 
     @callback
     def _handle_voltage_update(self, station_id: str, voltage_data: VoltageData) -> None:
-        """Handle real-time voltage update from WebSocket."""
+        """Handle real-time voltage update from WebSocket.
+
+        Only triggers a state update when at least one voltage value changes
+        by more than VOLTAGE_CHANGE_THRESHOLD volts, to avoid writing a new
+        HA state (and recorder entry) on every WebSocket message.
+        """
         if self.data is None:
             return
+
+        VOLTAGE_CHANGE_THRESHOLD = 0.1  # Volts
+
+        def _changed(new: float, old: float) -> bool:
+            """Return True if the value changed beyond the threshold."""
+            return abs((new or 0.0) - (old or 0.0)) > VOLTAGE_CHANGE_THRESHOLD
 
         # Find the device with this station_id
         for device_id, device_state in self.data.items():
             if device_state.station_id == station_id:
-                # Update the voltage reading
+                existing = device_state.voltage
+
+                # Only push a state update if something meaningful changed
+                if not (
+                    _changed(voltage_data.voltage, existing.voltage)
+                    or _changed(voltage_data.voltage_hi, existing.voltage_hi)
+                    or _changed(voltage_data.voltage_lo, existing.voltage_lo)
+                    or _changed(voltage_data.average_peaks_max, existing.average_peaks_max)
+                ):
+                    return  # Nothing changed beyond threshold — skip update
+
                 device_state.voltage = VoltageReading(
                     voltage=voltage_data.voltage,
                     voltage_hi=voltage_data.voltage_hi,
@@ -73,20 +94,31 @@ class WhiskerDataUpdateCoordinator(DataUpdateCoordinator[dict[str, DeviceState]]
         if not data or self._ws_connected:
             return
 
-        # Get api_key and user_id from the client
-        api_key = self.client.api_key
         user_id = self.client.user_id
 
-        if not api_key or not user_id:
-            _LOGGER.debug("No api_key or user_id, skipping WebSocket connection")
+        if not user_id:
+            _LOGGER.debug("No user_id available, skipping WebSocket connection")
             return
+
+        # Provide a callback that returns the api_key for WebSocket stream auth.
+        # The api_key (from Cognito user attributes) is the credential the
+        # SignalR server expects for InitializeStreaming — not the access token.
+        # We still call _ensure_token() first to guarantee the client is
+        # authenticated and api_key has been populated.
+        async def get_stream_token() -> str:
+            await self.client._ensure_token()
+            api_key = self.client.api_key
+            if not api_key:
+                raise ValueError("api_key is not available for WebSocket stream auth")
+            _LOGGER.debug("Using api_key for WebSocket stream auth (length=%d)", len(api_key))
+            return api_key
 
         # Connect to each device's WebSocket stream
         for device_id, device_state in data.items():
             if device_state.station_id:
                 try:
                     connected = await self._ws_manager.connect_device(
-                        api_key=api_key,
+                        get_stream_token=get_stream_token,
                         user_id=user_id,
                         station_id=device_state.station_id,
                     )

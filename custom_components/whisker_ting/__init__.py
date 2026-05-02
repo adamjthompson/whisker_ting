@@ -15,6 +15,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .api import WhiskerApiClient, WhiskerAuthError, WhiskerConnectionError
 from .const import (
     CONF_PASSWORD,
+    CONF_REFRESH_TOKEN,
     CONF_SCAN_INTERVAL,
     CONF_USERNAME,
     DEFAULT_SCAN_INTERVAL,
@@ -37,13 +38,22 @@ PLATFORMS: list[Platform] = [Platform.BINARY_SENSOR, Platform.SENSOR]
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Whisker Ting from a config entry."""
     username = entry.data[CONF_USERNAME]
-    password = entry.data[CONF_PASSWORD]
+    # Use .get() so it doesn't crash on new entries that only have a refresh token
+    password = entry.data.get(CONF_PASSWORD)
+    refresh_token = entry.data.get(CONF_REFRESH_TOKEN)
     scan_interval = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
 
     session = async_get_clientsession(hass)
-    client = WhiskerApiClient(session, username, password)
+    
+    # Initialize client with whatever credentials we have
+    client = WhiskerApiClient(
+        session, 
+        username=username, 
+        password=password, 
+        refresh_token=refresh_token
+    )
 
-    # Test the connection
+    # Test the connection (this will perform auth or token refresh)
     try:
         if not await client.test_connection():
             raise ConfigEntryNotReady("Failed to connect to Whisker Ting API")
@@ -51,6 +61,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         raise ConfigEntryAuthFailed("Invalid authentication") from err
     except WhiskerConnectionError as err:
         raise ConfigEntryNotReady(f"Connection error: {err}") from err
+
+    # MIGRATION: If a plaintext password is still in the config entry, remove it
+    # and store the refresh token we just obtained/validated.
+    if CONF_PASSWORD in entry.data:
+        _LOGGER.info("Migrating Whisker Ting config entry to remove plaintext password")
+        new_data = {**entry.data}
+        new_data[CONF_REFRESH_TOKEN] = client._refresh_token
+        new_data.pop(CONF_PASSWORD, None)
+        hass.config_entries.async_update_entry(entry, data=new_data)
 
     # Create the coordinator
     coordinator = WhiskerDataUpdateCoordinator(hass, client, session, scan_interval)
