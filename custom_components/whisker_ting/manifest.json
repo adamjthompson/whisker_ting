@@ -4,10 +4,10 @@
   "codeowners": ["@simplytoast1", "@adamjthompson"],
   "config_flow": true,
   "dependencies": [],
-  "documentation": "https://github.com/simplytoast1/ha-whisker-ting",
+  "documentation": "https://github.com/adamjthompson/whisker_ting",
   "integration_type": "service",
   "iot_class": "cloud_push",
-  "issue_tracker": "https://github.com/simplytoast1/ha-whisker-ting/issues",
+  "issue_tracker": "https://github.com/adamjthompson/whisker_ting/issues",
   "requirements": ["aiohttp>=3.8.0", "msgpack>=1.0.0"],
   "version": "1.0.2"
 }

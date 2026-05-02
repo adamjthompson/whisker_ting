@@ -1,7 +1,4 @@
-# Whisker Ting Integration for Home Assistant
-
-[![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://github.com/hacs/integration)
-[![GitHub Release](https://img.shields.io/github/release/aidenmitchell/ha-whisker-ting.svg)](https://github.com/aidenmitchell/ha-whisker-ting/releases)
+# Ting Integration for Home Assistant
 
 Home Assistant integration for [Whisker Labs Ting](https://www.tingfire.com/) electrical fire safety sensors.
 
@@ -27,7 +24,7 @@ Home Assistant integration for [Whisker Labs Ting](https://www.tingfire.com/) el
 1. Open HACS in Home Assistant
 2. Click the three dots in the top right corner
 3. Select "Custom repositories"
-4. Add `https://github.com/aidenmitchell/ha-whisker-ting` as an Integration
+4. Add `https://github.com/adamjthompson/whisker_ting` as an Integration
 5. Click "Download" on the Whisker Ting integration
 6. Restart Home Assistant
 
