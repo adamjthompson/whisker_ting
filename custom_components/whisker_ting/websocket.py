@@ -67,6 +67,7 @@ class WhiskerWebSocket:
         self._stale_check_task: asyncio.Task | None = None
         self._message_id = 0
         self._first_data_received = asyncio.Event()
+        self._stream_rejected = asyncio.Event()  # Set when server returns Completion result:null
         self._last_data_time: datetime | None = None
         self._shutting_down = False
 
@@ -198,7 +199,10 @@ class WhiskerWebSocket:
             await self._ws.send_bytes(init_msg)
 
             self._connected = True
-            self._last_data_time = datetime.now(UTC)
+            # Note: _last_data_time is intentionally NOT set here.
+            # It is only set when the first real updateComboBinaryData packet
+            # arrives, so the stale check doesn't fire on connections that
+            # never receive data (e.g. when auth is correct but stream is silent).
 
             # Start background tasks
             self._receive_task = asyncio.create_task(self._receive_loop())
@@ -239,13 +243,35 @@ class WhiskerWebSocket:
     async def wait_for_data(self, timeout: float = 5.0) -> bool:
         """Wait for the first voltage data to be received.
 
-        Returns True if data was received, False if timeout.
+        Returns True if data was received within the timeout.
+        Returns False immediately if the server signals rejection via a
+        Completion result:null message, rather than waiting out the full timeout.
         """
         try:
-            await asyncio.wait_for(self._first_data_received.wait(), timeout=timeout)
-            return True
-        except asyncio.TimeoutError:
-            _LOGGER.debug("Timeout waiting for first voltage data")
+            # Race between data arriving and server rejecting the stream
+            done, _ = await asyncio.wait(
+                [
+                    asyncio.ensure_future(self._first_data_received.wait()),
+                    asyncio.ensure_future(self._stream_rejected.wait()),
+                ],
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if not done:
+                _LOGGER.debug("Timeout waiting for first voltage data from station %s", self._station_id)
+                return False
+
+            if self._stream_rejected.is_set() and not self._first_data_received.is_set():
+                _LOGGER.debug(
+                    "Stream rejected by server for station %s — skipping timeout",
+                    self._station_id,
+                )
+                return False
+
+            return self._first_data_received.is_set()
+
+        except asyncio.CancelledError:
             return False
 
     async def _receive_loop(self) -> None:
@@ -263,15 +289,34 @@ class WhiskerWebSocket:
                         len(msg.data),
                         msg.data[:200].hex(),
                     )
-                    # Check if it's a voltage update
+                    # Check if server returned a SignalR Completion (type:3) with
+                    # result:null — this is the server's silent rejection pattern
+                    # for InitializeStreaming when the station_id is not authorized.
+                    # Detected by the presence of MSG_TYPE_COMPLETION (3) in the
+                    # decoded payload AND absence of voltage data.
                     if b"updateComboBinaryData" in msg.data:
                         voltage_data = self._decode_voltage_data(msg.data)
                         if voltage_data and self._on_voltage_update:
                             self._last_data_time = datetime.now(UTC)
                             self._on_voltage_update(self._station_id, voltage_data)
-                            # Signal that we've received data
                             if not self._first_data_received.is_set():
                                 self._first_data_received.set()
+                    elif b"Failed to invoke" in msg.data or (
+                        # Detect SignalR Completion result:null (type:3).
+                        # The msgpack-encoded type:3 byte is 0x03, which appears
+                        # reliably in the first few bytes of every Completion frame.
+                        # We also confirm no voltage data is present to avoid
+                        # false positives on any other short messages.
+                        b"\x03" in msg.data[:20] and
+                        b"updateComboBinaryData" not in msg.data
+                    ):
+                        _LOGGER.debug(
+                            "Server returned Completion result:null for station %s "
+                            "— station_id not authorized for streaming",
+                            self._station_id,
+                        )
+                        if not self._stream_rejected.is_set():
+                            self._stream_rejected.set()
                     elif msg.data == b"\x02\x91\x06":  # Ping response
                         _LOGGER.debug("Received ping response")
 
@@ -301,7 +346,13 @@ class WhiskerWebSocket:
             self._on_disconnect(self._station_id)
 
     async def _stale_data_check_loop(self) -> None:
-        """Check for stale data and trigger reconnect if needed."""
+        """Check for stale data and trigger reconnect if needed.
+
+        The stale clock only starts after the first real data packet arrives
+        (_last_data_time is None until then). This prevents the check from
+        firing on connections that are authenticated but receive no stream
+        data — which would cause an infinite reconnect loop.
+        """
         while self._connected and not self._shutting_down:
             try:
                 await asyncio.sleep(self.STALE_DATA_THRESHOLD)
@@ -309,19 +360,21 @@ class WhiskerWebSocket:
                 if not self._connected or self._shutting_down:
                     break
 
-                if self._last_data_time:
-                    time_since_update = (datetime.now(UTC) - self._last_data_time).total_seconds()
-                    if time_since_update > self.STALE_DATA_THRESHOLD:
-                        _LOGGER.error(
-                            "WebSocket data stale for station %s (no update in %.0f seconds), reconnecting",
-                            self._station_id,
-                            time_since_update,
-                        )
-                        self._connected = False
-                        # Trigger reconnect via callback
-                        if self._on_disconnect:
-                            self._on_disconnect(self._station_id)
-                        break
+                # Skip check until at least one real data packet has arrived
+                if self._last_data_time is None:
+                    continue
+
+                time_since_update = (datetime.now(UTC) - self._last_data_time).total_seconds()
+                if time_since_update > self.STALE_DATA_THRESHOLD:
+                    _LOGGER.error(
+                        "WebSocket data stale for station %s (no update in %.0f seconds), reconnecting",
+                        self._station_id,
+                        time_since_update,
+                    )
+                    self._connected = False
+                    if self._on_disconnect:
+                        self._on_disconnect(self._station_id)
+                    break
 
             except asyncio.CancelledError:
                 break
