@@ -30,7 +30,7 @@ _STATION_ID_CANDIDATES = [
 
 # How long to wait for voltage data after sending InitializeStreaming
 # before giving up and trying the next candidate
-_PROBE_TIMEOUT = 10.0  # seconds
+_PROBE_TIMEOUT = 35.0  # seconds
 
 
 class WhiskerDataUpdateCoordinator(DataUpdateCoordinator[dict[str, DeviceState]]):
