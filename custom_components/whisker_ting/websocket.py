@@ -165,10 +165,15 @@ class WhiskerWebSocket:
         try:
             _LOGGER.debug("Connecting to SignalR hub: %s", SIGNALR_URL)
 
+            # The server authorizes the connection at the HTTP upgrade level
+            # using the x-wl-api-key header — confirmed via Charles Proxy capture
+            # of the official Ting iOS app. Without this header, InitializeStreaming
+            # returns result:null silently for all callers regardless of arguments.
             self._ws = await self._session.ws_connect(
                 SIGNALR_URL,
                 headers={
                     "Origin": "ionic://localhost",
+                    "x-wl-api-key": self._stream_token,
                 },
             )
 
