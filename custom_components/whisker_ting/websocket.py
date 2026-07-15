@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import struct
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Callable
@@ -121,67 +120,70 @@ class WhiskerWebSocket:
         """Encode a SignalR ping message (length-prefixed array ``[6]``)."""
         return self._frame(msgpack.packb([MSG_TYPE_PING], use_bin_type=True))
 
-    def _decode_voltage_data(self, data: bytes) -> VoltageData | None:
-        """Decode voltage data from MessagePack message."""
+    @staticmethod
+    def _iter_messages(data: bytes):
+        """Yield each decoded SignalR message contained in a frame.
+
+        A single WebSocket frame may hold one or more length-prefixed
+        MessagePack messages (a 7-bit varint byte length followed by the
+        payload). Incomplete or undecodable trailing bytes are skipped.
+        """
+        i = 0
+        n = len(data)
+        while i < n:
+            length = 0
+            shift = 0
+            while i < n:
+                b = data[i]
+                i += 1
+                length |= (b & 0x7F) << shift
+                if not b & 0x80:
+                    break
+                shift += 7
+            else:
+                return  # incomplete length prefix
+            if length <= 0 or i + length > n:
+                return  # incomplete or malformed payload
+            chunk = data[i : i + length]
+            i += length
+            try:
+                yield msgpack.unpackb(chunk, raw=False)
+            except Exception as err:  # noqa: BLE001 - tolerate a bad frame
+                _LOGGER.debug("Skipping undecodable frame: %s", err)
+
+    def _parse_voltage(self, payload: dict) -> VoltageData | None:
+        """Build VoltageData from a decoded updateComboBinaryData payload.
+
+        Reads values by field name from the properly-decoded MessagePack map.
+        (The previous implementation scanned raw bytes for 0xCB float markers,
+        which misaligned whenever the timestamp payload happened to contain a
+        0xCB byte and produced garbage voltages such as 200–500 V.)
+        """
         try:
-            # Find double values in the message (0xcb prefix)
-            doubles = []
-            pos = 0
-            while pos < len(data):
-                if data[pos] == 0xCB:  # float64 marker
-                    val = struct.unpack(">d", data[pos + 1 : pos + 9])[0]
-                    doubles.append(val)
-                    pos += 9
-                else:
-                    pos += 1
+            voltage = float(payload["Voltage"])
+        except (KeyError, TypeError, ValueError):
+            return None
 
-            if len(doubles) >= 4:
-                voltage = doubles[0]
-                peaks = doubles[1]
-                voltage_hi = doubles[2]
-                voltage_lo = doubles[3]
+        # Plausibility guard for mains voltage; genuine readings are ~100–130 V
+        # (or ~200–250 V outside North America). Backstop only — correct parsing
+        # already prevents the old garbage values.
+        if not 1.0 <= voltage <= 400.0:
+            _LOGGER.debug("Discarding implausible voltage reading: %sV", voltage)
+            return None
 
-                # Filter out obviously bad readings
-                # Only discard zero/near-zero or clearly garbage values
-                if abs(voltage) < 1 or abs(voltage) > 1000:
-                    _LOGGER.debug(
-                        "Discarding anomalous voltage reading: %.2fV", voltage
-                    )
-                    return None
+        def _field(key: str, default: float) -> float:
+            try:
+                return float(payload[key])
+            except (KeyError, TypeError, ValueError):
+                return default
 
-                # Find timestamp (uint64 with 0xd7 or 0xcf prefix)
-                timestamp = datetime.now(UTC)  # Default to now (timezone-aware)
-                pos = 0
-                while pos < len(data) - 8:
-                    if data[pos] == 0xD7:  # ext8 with type -1 (timestamp)
-                        pos += 1
-                        if data[pos] == 0xFF:  # timestamp type
-                            pos += 1
-                            ts_val = struct.unpack(">Q", data[pos : pos + 8])[0]
-                            # SignalR uses .NET ticks (100ns since 1/1/0001)
-                            # Convert to Unix timestamp
-                            try:
-                                timestamp = datetime.fromtimestamp(
-                                    ts_val / 10000000 - 62135596800, tz=UTC
-                                )
-                            except (ValueError, OSError):
-                                pass
-                            break
-                        pos += 7
-                    else:
-                        pos += 1
-
-                return VoltageData(
-                    timestamp=timestamp,
-                    voltage=voltage,
-                    average_peaks_max=peaks,
-                    voltage_hi=voltage_hi,
-                    voltage_lo=voltage_lo,
-                )
-        except Exception as err:
-            _LOGGER.debug("Error decoding voltage data: %s", err)
-
-        return None
+        return VoltageData(
+            timestamp=datetime.now(UTC),
+            voltage=voltage,
+            average_peaks_max=_field("AveragePeaksMax", 0.0),
+            voltage_hi=_field("VoltageHi", voltage),
+            voltage_lo=_field("VoltageLo", voltage),
+        )
 
     async def connect(self) -> bool:
         """Connect to the SignalR hub."""
@@ -312,41 +314,49 @@ class WhiskerWebSocket:
                 )
 
                 if msg.type == aiohttp.WSMsgType.BINARY:
-                    _LOGGER.debug(
-                        "Received binary message (%d bytes): %s",
-                        len(msg.data),
-                        msg.data[:200].hex(),
-                    )
-                    # Check if server returned a SignalR Completion (type:3) with
-                    # result:null — this is the server's silent rejection pattern
-                    # for InitializeStreaming when the station_id is not authorized.
-                    # Detected by the presence of MSG_TYPE_COMPLETION (3) in the
-                    # decoded payload AND absence of voltage data.
-                    if b"updateComboBinaryData" in msg.data:
-                        voltage_data = self._decode_voltage_data(msg.data)
-                        if voltage_data and self._on_voltage_update:
-                            self._last_data_time = datetime.now(UTC)
-                            self._on_voltage_update(self._station_id, voltage_data)
-                            if not self._first_data_received.is_set():
-                                self._first_data_received.set()
-                    elif b"Failed to invoke" in msg.data or (
-                        # Detect SignalR Completion result:null (type:3).
-                        # The msgpack-encoded type:3 byte is 0x03, which appears
-                        # reliably in the first few bytes of every Completion frame.
-                        # We also confirm no voltage data is present to avoid
-                        # false positives on any other short messages.
-                        b"\x03" in msg.data[:20] and
-                        b"updateComboBinaryData" not in msg.data
-                    ):
-                        _LOGGER.debug(
-                            "Server returned Completion result:null for station %s "
-                            "— station_id not authorized for streaming",
-                            self._station_id,
-                        )
-                        if not self._stream_rejected.is_set():
-                            self._stream_rejected.set()
-                    elif msg.data == b"\x02\x91\x06":  # Ping response
-                        _LOGGER.debug("Received ping response")
+                    _LOGGER.debug("Received binary message (%d bytes)", len(msg.data))
+                    for message in self._iter_messages(msg.data):
+                        if not isinstance(message, list) or not message:
+                            continue
+                        mtype = message[0]
+
+                        if (
+                            mtype == MSG_TYPE_INVOCATION
+                            and len(message) >= 5
+                            and message[3] == "updateComboBinaryData"
+                        ):
+                            args = message[4]
+                            payload = args[0] if isinstance(args, list) and args else None
+                            if not isinstance(payload, dict):
+                                continue
+                            voltage_data = self._parse_voltage(payload)
+                            if voltage_data and self._on_voltage_update:
+                                self._last_data_time = datetime.now(UTC)
+                                self._on_voltage_update(self._station_id, voltage_data)
+                                if not self._first_data_received.is_set():
+                                    self._first_data_received.set()
+
+                        elif mtype == MSG_TYPE_COMPLETION:
+                            # With a non-blocking (null id) InitializeStreaming a
+                            # Completion only arrives when the server refuses the
+                            # stream (e.g. an unauthorized station_id while probing).
+                            if (
+                                not self._first_data_received.is_set()
+                                and not self._stream_rejected.is_set()
+                            ):
+                                _LOGGER.debug(
+                                    "Stream rejected (Completion) for station %s",
+                                    self._station_id,
+                                )
+                                self._stream_rejected.set()
+
+                        elif mtype == MSG_TYPE_CLOSE:
+                            _LOGGER.warning(
+                                "Server closed stream for station %s", self._station_id
+                            )
+                            self._connected = False
+                            break
+                        # MSG_TYPE_PING and any other type: ignore
 
                 elif msg.type == aiohttp.WSMsgType.TEXT:
                     _LOGGER.debug("Received text message: %s", msg.data)
