@@ -65,7 +65,6 @@ class WhiskerWebSocket:
         self._ping_task: asyncio.Task | None = None
         self._receive_task: asyncio.Task | None = None
         self._stale_check_task: asyncio.Task | None = None
-        self._message_id = 0
         self._first_data_received = asyncio.Event()
         self._stream_rejected = asyncio.Event()  # Set when server returns Completion result:null
         self._last_data_time: datetime | None = None
@@ -76,27 +75,51 @@ class WhiskerWebSocket:
         """Return True if connected."""
         return self._connected
 
+    @staticmethod
+    def _frame(payload: bytes) -> bytes:
+        """Prefix a msgpack payload with its SignalR length header.
+
+        The SignalR MessagePack Hub Protocol frames every message as a
+        7-bit-encoded varint byte length followed by the msgpack payload.
+        Without this prefix the server cannot determine the message
+        boundary and silently drops the frame.
+        """
+        length = len(payload)
+        header = bytearray()
+        while True:
+            byte = length & 0x7F
+            length >>= 7
+            if length:
+                header.append(byte | 0x80)
+            else:
+                header.append(byte)
+                break
+        return bytes(header) + payload
+
     def _encode_invocation(self, method: str, args: list) -> bytes:
-        """Encode a SignalR invocation message."""
-        self._message_id += 1
-        # SignalR MessagePack invocation format:
-        # {1: [type, headers, invocationId, target, arguments]}
-        # Type 1 = INVOCATION (not streaming)
-        message = {
-            1: [
+        """Encode a SignalR invocation message.
+
+        The wire format is a length-prefixed msgpack *array*
+        ``[type, headers, invocationId, target, arguments]`` — not a
+        map. ``invocationId`` is null so this is a non-blocking
+        invocation: the server streams results back via
+        ``updateComboBinaryData`` messages without sending a Completion.
+        """
+        payload = msgpack.packb(
+            [
                 MSG_TYPE_INVOCATION,
                 {},  # headers
-                str(self._message_id),  # invocationId
+                None,  # invocationId (null = non-blocking)
                 method,
                 args,
-            ]
-        }
-        return msgpack.packb(message, use_bin_type=True)
+            ],
+            use_bin_type=True,
+        )
+        return self._frame(payload)
 
     def _encode_ping(self) -> bytes:
-        """Encode a SignalR ping message."""
-        # Ping is just {1: [6]}
-        return msgpack.packb({1: [MSG_TYPE_PING]}, use_bin_type=True)
+        """Encode a SignalR ping message (length-prefixed array ``[6]``)."""
+        return self._frame(msgpack.packb([MSG_TYPE_PING], use_bin_type=True))
 
     def _decode_voltage_data(self, data: bytes) -> VoltageData | None:
         """Decode voltage data from MessagePack message."""
