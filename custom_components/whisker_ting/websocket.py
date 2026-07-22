@@ -26,6 +26,56 @@ MSG_TYPE_PING = 6
 MSG_TYPE_CLOSE = 7
 
 
+def _encode_length_prefix(length: int) -> bytes:
+    """Encode a message length as a SignalR MessagePack LEB128 varint prefix."""
+    out = bytearray()
+    while True:
+        byte = length & 0x7F
+        length >>= 7
+        if length:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return bytes(out)
+
+
+def _frame_message(payload: bytes) -> bytes:
+    """Prepend the SignalR binary-framing length prefix to a MessagePack payload."""
+    return _encode_length_prefix(len(payload)) + payload
+
+
+def _split_framed_messages(data: bytes) -> list[bytes]:
+    """Split a raw WebSocket binary frame into individual SignalR sub-messages.
+
+    Each sub-message is prefixed with a LEB128 varint byte-length; this
+    strips that prefix and returns the raw payload of each complete
+    sub-message found in the buffer.
+    """
+    messages = []
+    pos = 0
+    while pos < len(data):
+        length = 0
+        shift = 0
+        prefix_complete = False
+        while pos < len(data):
+            byte = data[pos]
+            pos += 1
+            length |= (byte & 0x7F) << shift
+            if not (byte & 0x80):
+                prefix_complete = True
+                break
+            shift += 7
+
+        if not prefix_complete or pos + length > len(data):
+            _LOGGER.debug("Incomplete SignalR sub-message in WS frame, dropping remainder")
+            break
+
+        messages.append(data[pos : pos + length])
+        pos += length
+
+    return messages
+
+
 @dataclass
 class VoltageData:
     """Real-time voltage data from WebSocket."""
@@ -79,24 +129,24 @@ class WhiskerWebSocket:
     def _encode_invocation(self, method: str, args: list) -> bytes:
         """Encode a SignalR invocation message."""
         self._message_id += 1
-        # SignalR MessagePack invocation format:
-        # {1: [type, headers, invocationId, target, arguments]}
-        # Type 1 = INVOCATION (not streaming)
-        message = {
-            1: [
-                MSG_TYPE_INVOCATION,
-                {},  # headers
-                str(self._message_id),  # invocationId
-                method,
-                args,
-            ]
-        }
-        return msgpack.packb(message, use_bin_type=True)
+        # SignalR MessagePack invocation format is a flat array:
+        # [type, headers, invocationId, target, arguments]
+        # Type 1 = INVOCATION (not streaming). The whole payload must be
+        # wrapped with a LEB128 length prefix per the SignalR binary framing
+        # spec — see _frame_message.
+        message = [
+            MSG_TYPE_INVOCATION,
+            {},  # headers
+            str(self._message_id),  # invocationId
+            method,
+            args,
+        ]
+        return _frame_message(msgpack.packb(message, use_bin_type=True))
 
     def _encode_ping(self) -> bytes:
         """Encode a SignalR ping message."""
-        # Ping is just {1: [6]}
-        return msgpack.packb({1: [MSG_TYPE_PING]}, use_bin_type=True)
+        # Ping is a flat array [6], length-prefixed like any other message.
+        return _frame_message(msgpack.packb([MSG_TYPE_PING], use_bin_type=True))
 
     def _decode_voltage_data(self, data: bytes) -> VoltageData | None:
         """Decode voltage data from MessagePack message."""
@@ -294,36 +344,43 @@ class WhiskerWebSocket:
                         len(msg.data),
                         msg.data[:200].hex(),
                     )
-                    # Check if server returned a SignalR Completion (type:3) with
-                    # result:null — this is the server's silent rejection pattern
-                    # for InitializeStreaming when the station_id is not authorized.
-                    # Detected by the presence of MSG_TYPE_COMPLETION (3) in the
-                    # decoded payload AND absence of voltage data.
-                    if b"updateComboBinaryData" in msg.data:
-                        voltage_data = self._decode_voltage_data(msg.data)
-                        if voltage_data and self._on_voltage_update:
-                            self._last_data_time = datetime.now(UTC)
-                            self._on_voltage_update(self._station_id, voltage_data)
-                            if not self._first_data_received.is_set():
-                                self._first_data_received.set()
-                    elif b"Failed to invoke" in msg.data or (
-                        # Detect SignalR Completion result:null (type:3).
-                        # The msgpack-encoded type:3 byte is 0x03, which appears
-                        # reliably in the first few bytes of every Completion frame.
-                        # We also confirm no voltage data is present to avoid
-                        # false positives on any other short messages.
-                        b"\x03" in msg.data[:20] and
-                        b"updateComboBinaryData" not in msg.data
-                    ):
-                        _LOGGER.debug(
-                            "Server returned Completion result:null for station %s "
-                            "— station_id not authorized for streaming",
-                            self._station_id,
-                        )
-                        if not self._stream_rejected.is_set():
-                            self._stream_rejected.set()
-                    elif msg.data == b"\x02\x91\x06":  # Ping response
-                        _LOGGER.debug("Received ping response")
+                    # A single WS binary frame can contain more than one
+                    # length-prefixed SignalR sub-message; split them apart
+                    # first so marker-scanning below can't cross message
+                    # boundaries and mis-detect an adjacent message.
+                    for sub_msg in _split_framed_messages(msg.data):
+                        # Check if server returned a SignalR Completion (type:3)
+                        # with result:null — this is the server's silent
+                        # rejection pattern for InitializeStreaming when the
+                        # station_id is not authorized. Detected by the
+                        # presence of MSG_TYPE_COMPLETION (3) in the decoded
+                        # payload AND absence of voltage data.
+                        if b"updateComboBinaryData" in sub_msg:
+                            voltage_data = self._decode_voltage_data(sub_msg)
+                            if voltage_data and self._on_voltage_update:
+                                self._last_data_time = datetime.now(UTC)
+                                self._on_voltage_update(self._station_id, voltage_data)
+                                if not self._first_data_received.is_set():
+                                    self._first_data_received.set()
+                        elif b"Failed to invoke" in sub_msg or (
+                            # Detect SignalR Completion result:null (type:3).
+                            # The msgpack-encoded type:3 byte is 0x03, which
+                            # appears reliably in the first few bytes of every
+                            # Completion frame. We also confirm no voltage
+                            # data is present to avoid false positives on any
+                            # other short messages.
+                            b"\x03" in sub_msg[:20] and
+                            b"updateComboBinaryData" not in sub_msg
+                        ):
+                            _LOGGER.debug(
+                                "Server returned Completion result:null for station %s "
+                                "— station_id not authorized for streaming",
+                                self._station_id,
+                            )
+                            if not self._stream_rejected.is_set():
+                                self._stream_rejected.set()
+                        elif sub_msg == b"\x91\x06":  # Ping from server
+                            _LOGGER.debug("Received keepalive ping from server")
 
                 elif msg.type == aiohttp.WSMsgType.TEXT:
                     _LOGGER.debug("Received text message: %s", msg.data)
