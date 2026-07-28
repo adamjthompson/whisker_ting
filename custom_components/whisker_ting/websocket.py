@@ -76,6 +76,29 @@ def _split_framed_messages(data: bytes) -> list[bytes]:
     return messages
 
 
+def _find_combo_binary_payload(obj: Any) -> dict | None:
+    """Find the updateComboBinaryData argument dict in a decoded invocation.
+
+    The invocation arguments list can carry a raw `bytes` value that is
+    itself a nested MessagePack-encoded blob, so `bytes` values are
+    unpacked and searched too.
+    """
+    if isinstance(obj, dict) and "Voltage" in obj:
+        return obj
+    if isinstance(obj, bytes):
+        try:
+            nested = msgpack.unpackb(obj, raw=False)
+        except Exception:
+            return None
+        return _find_combo_binary_payload(nested)
+    if isinstance(obj, (list, tuple)):
+        for item in obj:
+            found = _find_combo_binary_payload(item)
+            if found is not None:
+                return found
+    return None
+
+
 @dataclass
 class VoltageData:
     """Real-time voltage data from WebSocket."""
@@ -149,66 +172,78 @@ class WhiskerWebSocket:
         return _frame_message(msgpack.packb([MSG_TYPE_PING], use_bin_type=True))
 
     def _decode_voltage_data(self, data: bytes) -> VoltageData | None:
-        """Decode voltage data from MessagePack message."""
+        """Decode voltage data from MessagePack message.
+
+        Reads named fields (Voltage, VoltageHi, VoltageLo, AveragePeaksMax)
+        from the decoded ComboBinaryData payload, rather than scanning raw
+        bytes for the 0xCB float64 marker — a raw scan can misread unrelated
+        fields (target name, headers, timestamp, counters) elsewhere in the
+        same message as if they were voltage readings.
+        """
         try:
-            # Find double values in the message (0xcb prefix)
-            doubles = []
-            pos = 0
-            while pos < len(data):
-                if data[pos] == 0xCB:  # float64 marker
-                    val = struct.unpack(">d", data[pos + 1 : pos + 9])[0]
-                    doubles.append(val)
-                    pos += 9
-                else:
-                    pos += 1
-
-            if len(doubles) >= 4:
-                voltage = doubles[0]
-                peaks = doubles[1]
-                voltage_hi = doubles[2]
-                voltage_lo = doubles[3]
-
-                # Filter out obviously bad readings
-                # Only discard zero/near-zero or clearly garbage values
-                if abs(voltage) < 1 or abs(voltage) > 1000:
-                    _LOGGER.debug(
-                        "Discarding anomalous voltage reading: %.2fV", voltage
-                    )
-                    return None
-
-                # Find timestamp (uint64 with 0xd7 or 0xcf prefix)
-                timestamp = datetime.now(UTC)  # Default to now (timezone-aware)
-                pos = 0
-                while pos < len(data) - 8:
-                    if data[pos] == 0xD7:  # ext8 with type -1 (timestamp)
-                        pos += 1
-                        if data[pos] == 0xFF:  # timestamp type
-                            pos += 1
-                            ts_val = struct.unpack(">Q", data[pos : pos + 8])[0]
-                            # SignalR uses .NET ticks (100ns since 1/1/0001)
-                            # Convert to Unix timestamp
-                            try:
-                                timestamp = datetime.fromtimestamp(
-                                    ts_val / 10000000 - 62135596800, tz=UTC
-                                )
-                            except (ValueError, OSError):
-                                pass
-                            break
-                        pos += 7
-                    else:
-                        pos += 1
-
-                return VoltageData(
-                    timestamp=timestamp,
-                    voltage=voltage,
-                    average_peaks_max=peaks,
-                    voltage_hi=voltage_hi,
-                    voltage_lo=voltage_lo,
-                )
+            unpacked = msgpack.unpackb(data, raw=False)
         except Exception as err:
-            _LOGGER.debug("Error decoding voltage data: %s", err)
+            _LOGGER.debug("Error decoding voltage data structure: %s", err)
+            return None
 
-        return None
+        payload = _find_combo_binary_payload(unpacked)
+        if payload is None:
+            return None
+
+        try:
+            voltage = float(payload["Voltage"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        # Filter out obviously bad readings
+        # Only discard zero/near-zero or clearly garbage values
+        if abs(voltage) < 1 or abs(voltage) > 1000:
+            _LOGGER.debug("Discarding anomalous voltage reading: %.2fV", voltage)
+            return None
+
+        def _field(key: str, default: float) -> float:
+            try:
+                return float(payload[key])
+            except (KeyError, TypeError, ValueError):
+                _LOGGER.debug(
+                    "ComboBinaryData payload missing/invalid field %r, using default",
+                    key,
+                )
+                return default
+
+        peaks = _field("AveragePeaksMax", 0.0)
+        voltage_hi = _field("VoltageHi", voltage)
+        voltage_lo = _field("VoltageLo", voltage)
+
+        # Find timestamp (uint64 with 0xd7 or 0xcf prefix)
+        timestamp = datetime.now(UTC)  # Default to now (timezone-aware)
+        pos = 0
+        while pos < len(data) - 8:
+            if data[pos] == 0xD7:  # ext8 with type -1 (timestamp)
+                pos += 1
+                if data[pos] == 0xFF:  # timestamp type
+                    pos += 1
+                    ts_val = struct.unpack(">Q", data[pos : pos + 8])[0]
+                    # SignalR uses .NET ticks (100ns since 1/1/0001)
+                    # Convert to Unix timestamp
+                    try:
+                        timestamp = datetime.fromtimestamp(
+                            ts_val / 10000000 - 62135596800, tz=UTC
+                        )
+                    except (ValueError, OSError):
+                        pass
+                    break
+                pos += 7
+            else:
+                pos += 1
+
+        return VoltageData(
+            timestamp=timestamp,
+            voltage=voltage,
+            average_peaks_max=peaks,
+            voltage_hi=voltage_hi,
+            voltage_lo=voltage_lo,
+        )
 
     async def connect(self) -> bool:
         """Connect to the SignalR hub."""
@@ -346,40 +381,50 @@ class WhiskerWebSocket:
                     )
                     # A single WS binary frame can contain more than one
                     # length-prefixed SignalR sub-message; split them apart
-                    # first so marker-scanning below can't cross message
-                    # boundaries and mis-detect an adjacent message.
+                    # first so message-type dispatch below can't cross
+                    # message boundaries and mis-detect an adjacent message.
                     for sub_msg in _split_framed_messages(msg.data):
-                        # Check if server returned a SignalR Completion (type:3)
-                        # with result:null — this is the server's silent
-                        # rejection pattern for InitializeStreaming when the
-                        # station_id is not authorized. Detected by the
-                        # presence of MSG_TYPE_COMPLETION (3) in the decoded
-                        # payload AND absence of voltage data.
-                        if b"updateComboBinaryData" in sub_msg:
+                        try:
+                            decoded = msgpack.unpackb(sub_msg, raw=False)
+                        except Exception as err:
+                            _LOGGER.debug("Skipping undecodable sub-message: %s", err)
+                            continue
+
+                        if not isinstance(decoded, list) or not decoded:
+                            continue
+                        mtype = decoded[0]
+
+                        if (
+                            mtype == MSG_TYPE_INVOCATION
+                            and len(decoded) >= 4
+                            and decoded[3] == "updateComboBinaryData"
+                        ):
                             voltage_data = self._decode_voltage_data(sub_msg)
                             if voltage_data and self._on_voltage_update:
                                 self._last_data_time = datetime.now(UTC)
                                 self._on_voltage_update(self._station_id, voltage_data)
                                 if not self._first_data_received.is_set():
                                     self._first_data_received.set()
-                        elif b"Failed to invoke" in sub_msg or (
-                            # Detect SignalR Completion result:null (type:3).
-                            # The msgpack-encoded type:3 byte is 0x03, which
-                            # appears reliably in the first few bytes of every
-                            # Completion frame. We also confirm no voltage
-                            # data is present to avoid false positives on any
-                            # other short messages.
-                            b"\x03" in sub_msg[:20] and
-                            b"updateComboBinaryData" not in sub_msg
-                        ):
+                        elif mtype == MSG_TYPE_COMPLETION:
+                            # InitializeStreaming's Completion — the server
+                            # only sends one for this invocation when the
+                            # station_id is not authorized for streaming
+                            # (either a null result or an error message);
+                            # a successfully accepted stream never gets one.
                             _LOGGER.debug(
-                                "Server returned Completion result:null for station %s "
+                                "Server returned Completion for station %s "
                                 "— station_id not authorized for streaming",
                                 self._station_id,
                             )
                             if not self._stream_rejected.is_set():
                                 self._stream_rejected.set()
-                        elif sub_msg == b"\x91\x06":  # Ping from server
+                        elif mtype == MSG_TYPE_CLOSE:
+                            _LOGGER.warning(
+                                "Server closed stream for station %s", self._station_id
+                            )
+                            self._connected = False
+                            break
+                        elif mtype == MSG_TYPE_PING:
                             _LOGGER.debug("Received keepalive ping from server")
 
                 elif msg.type == aiohttp.WSMsgType.TEXT:
