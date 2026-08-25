@@ -10,7 +10,7 @@ Home Assistant integration for [Whisker Labs Ting](https://www.tingfire.com/) el
   - Average peaks
 - **Fire hazard status** monitoring
   - Electrical Fire Hazard (EFH) detection
-  - Utility Fire Hazard (UFH) detection
+  - Unverified Fire Hazard (UFH) detection
   - Learning mode status
 - **Device diagnostics**
   - Firmware version
@@ -50,7 +50,7 @@ Home Assistant integration for [Whisker Labs Ting](https://www.tingfire.com/) el
 | Voltage low | Peak low voltage |
 | Hazard status | Overall hazard status (no_hazards, hazard_detected, learning) |
 | EFH status | Electrical Fire Hazard status |
-| UFH status | Utility Fire Hazard status |
+| UFH status | Unverified Fire Hazard status |
 
 ## Binary Sensors
 

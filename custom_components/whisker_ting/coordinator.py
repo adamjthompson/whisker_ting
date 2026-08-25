@@ -156,13 +156,26 @@ class WhiskerDataUpdateCoordinator(DataUpdateCoordinator[dict[str, DeviceState]]
                 )
                 return candidate
 
-            # No data — disconnect and try next candidate
+            # No data — check whether the server explicitly rejected the
+            # stream (in which case the remaining candidates would just get
+            # the same rejection) before disconnecting and trying the next.
+            rejected = self._ws_manager.is_stream_rejected(candidate)
+            await self._ws_manager.disconnect_device(candidate)
+
+            if rejected:
+                _LOGGER.warning(
+                    "Stream subscription refused by server for device %s "
+                    "(tried station_id '%s') — voltage sensors will be unavailable",
+                    device_state.serial_number,
+                    candidate,
+                )
+                return None
+
             _LOGGER.debug(
                 "No data received for station_id '%s' within %.0fs, trying next",
                 candidate,
                 _PROBE_TIMEOUT,
             )
-            await self._ws_manager.disconnect_device(candidate)
 
         _LOGGER.warning(
             "Could not find a working station_id for device %s — "

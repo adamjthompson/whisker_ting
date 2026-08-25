@@ -149,6 +149,11 @@ class WhiskerWebSocket:
         """Return True if connected."""
         return self._connected
 
+    @property
+    def stream_rejected(self) -> bool:
+        """Return True if the server signaled rejection via a Completion message."""
+        return self._stream_rejected.is_set()
+
     def _encode_invocation(self, method: str, args: list) -> bytes:
         """Encode a SignalR invocation message."""
         self._message_id += 1
@@ -339,7 +344,7 @@ class WhiskerWebSocket:
         """
         try:
             # Race between data arriving and server rejecting the stream
-            done, _ = await asyncio.wait(
+            done, pending = await asyncio.wait(
                 [
                     asyncio.ensure_future(self._first_data_received.wait()),
                     asyncio.ensure_future(self._stream_rejected.wait()),
@@ -347,6 +352,12 @@ class WhiskerWebSocket:
                 timeout=timeout,
                 return_when=asyncio.FIRST_COMPLETED,
             )
+
+            # asyncio.wait with FIRST_COMPLETED leaves the losing task(s)
+            # pending; left uncancelled they're later garbage-collected and
+            # log "Task was destroyed but it is pending!" at ERROR level.
+            for task in pending:
+                task.cancel()
 
             if not done:
                 _LOGGER.debug("Timeout waiting for first voltage data from station %s", self._station_id)
@@ -719,3 +730,12 @@ class WhiskerWebSocketManager:
         if ws:
             return await ws.wait_for_data(timeout=timeout)
         return False
+
+    def is_stream_rejected(self, station_id: str) -> bool:
+        """Return True if the server rejected the stream for this station.
+
+        Only meaningful while the connection is still present — check this
+        before disconnecting.
+        """
+        ws = self._connections.get(station_id)
+        return ws.stream_rejected if ws else False
