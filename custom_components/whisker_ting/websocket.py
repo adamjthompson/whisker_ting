@@ -140,7 +140,7 @@ class WhiskerWebSocket:
         self._stale_check_task: asyncio.Task | None = None
         self._message_id = 0
         self._first_data_received = asyncio.Event()
-        self._stream_rejected = asyncio.Event()  # Set when server returns Completion result:null
+        self._stream_rejected = asyncio.Event()  # Set only on an error Completion (resultKind == 1)
         self._last_data_time: datetime | None = None
         self._shutting_down = False
 
@@ -255,10 +255,12 @@ class WhiskerWebSocket:
         try:
             _LOGGER.debug("Connecting to SignalR hub: %s", SIGNALR_URL)
 
-            # The server authorizes the connection at the HTTP upgrade level
-            # using the x-wl-api-key header — confirmed via Charles Proxy capture
-            # of the official Ting iOS app. Without this header, InitializeStreaming
-            # returns result:null silently for all callers regardless of arguments.
+            # A Proxyman capture of the official Ting iOS app shows its
+            # WebSocket upgrade carries no auth header at all (the app is an
+            # Ionic/Capacitor webview using the browser WebSocket API, which
+            # can't set custom headers) — the api_key is instead passed as
+            # an InitializeStreaming invocation argument, further down. This
+            # header is likely inert, but harmless, so it's left in place.
             self._ws = await self._session.ws_connect(
                 SIGNALR_URL,
                 headers={
@@ -417,18 +419,28 @@ class WhiskerWebSocket:
                                 if not self._first_data_received.is_set():
                                     self._first_data_received.set()
                         elif mtype == MSG_TYPE_COMPLETION:
-                            # InitializeStreaming's Completion — the server
-                            # only sends one for this invocation when the
-                            # station_id is not authorized for streaming
-                            # (either a null result or an error message);
-                            # a successfully accepted stream never gets one.
-                            _LOGGER.debug(
-                                "Server returned Completion for station %s "
-                                "— station_id not authorized for streaming",
-                                self._station_id,
-                            )
-                            if not self._stream_rejected.is_set():
-                                self._stream_rejected.set()
+                            # InitializeStreaming's Completion carries a
+                            # resultKind at index 3: 1 = error (the actual
+                            # failure signal, with the error message at
+                            # index 4). Any other resultKind — including 3
+                            # (non-void result) with a null result — is just
+                            # the normal ack for this call: a real capture of
+                            # the official app shows it receives this same
+                            # ack on every InitializeStreaming call, including
+                            # ones that go on to stream data ~600ms later.
+                            if len(decoded) >= 5 and decoded[3] == 1:
+                                _LOGGER.debug(
+                                    "Server returned error Completion for station %s: %s",
+                                    self._station_id,
+                                    decoded[4],
+                                )
+                                if not self._stream_rejected.is_set():
+                                    self._stream_rejected.set()
+                            else:
+                                _LOGGER.debug(
+                                    "Received InitializeStreaming ack (Completion) for station %s",
+                                    self._station_id,
+                                )
                         elif mtype == MSG_TYPE_CLOSE:
                             _LOGGER.warning(
                                 "Server closed stream for station %s", self._station_id
